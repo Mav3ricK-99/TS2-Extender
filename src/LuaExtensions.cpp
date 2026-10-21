@@ -18,6 +18,10 @@
 #include "ts2/cGZFramework.h"
 #include "ts2/RZ.h"
 #include "ts2/cIGZWin.h"
+#include "Relaunch.h"
+#include "Network.h"
+#include <vector>
+#include "config.h"
 #define KEY_COUNT 256
 
 namespace LuaExtensions {
@@ -29,11 +33,51 @@ namespace LuaExtensions {
 	static SHORT currentInputState[KEY_COUNT]{};
 	static SHORT lastInputState[KEY_COUNT]{};
 
+	// Calls the Lua callbacks of the finished DownloadFile / ExtractNeighborhood / ZipNeighborhood / UploadNeighborhood / HttpRequest jobs.
+	// Runs on the game thread (FrameUpdate), the only place where network results may touch Lua.
+	static void DeliverNetworkResults() {
+		std::vector<Network::Completed> completed;
+		Network::TakeCompleted(completed);
+		for (Network::Completed& result : completed) {
+			lua_State* luaState = result.luaState;
+			// The Lua state was recreated while the job was running: its callback no longer exists.
+			if (result.ownerState != Core::_instance->m_LuaState) {
+				Log("Network: dropped the result of a job started in a previous Lua state.\n");
+				continue;
+			}
+			lua_rawgeti(luaState, LUA_REGISTRYINDEX, result.callbackRef);
+			lua_pushboolean(luaState, result.ok ? 1 : 0);
+			if (result.ok) {
+				// There is no lua_pushnil wrapper: growing the stack with lua_settop fills the new slot with nil.
+				lua_settop(luaState, lua_gettop(luaState) + 1);
+			}
+			else {
+				lua_pushstring(luaState, result.error.c_str());
+			}
+			int argCount = 3;
+			if (result.isRequest) {
+				// HttpRequest and UploadNeighborhood: callback(ok, err, status, response). status is 0 when the server never answered.
+				lua_pushnumber(luaState, static_cast<double>(result.status));
+				lua_pushstring(luaState, result.response.c_str());
+				argCount = 4;
+			}
+			else {
+				lua_pushnumber(luaState, static_cast<double>(result.bytes));
+			}
+			if (lua_pcall(luaState, argCount, 0, 0) != 0) {
+				Log("Error calling Lua network callback: %s\n", lua_tostring(luaState, -1));
+				lua_pop(luaState, 1);
+			}
+			luaL_unref(luaState, LUA_REGISTRYINDEX, result.callbackRef);
+		}
+	}
+
 	void FrameUpdate() {
 		memcpy(lastInputState, currentInputState, sizeof(currentInputState));
 		for (int i = 0; i < KEY_COUNT; i++) {
 			currentInputState[i] = GetAsyncKeyState(i);
 		}
+		DeliverNetworkResults();
 	}
 
 	static std::string GetProcessDirectory() {
@@ -421,6 +465,220 @@ namespace LuaExtensions {
 		return 0;
 	}
 
+	// boolean ok, string err RelaunchGame(string args)
+	// Arms a restart of the game with the given launch args, e.g. -load:"N001;165 Sim Lane".
+	// Presses Alt+F4 (if the game window is focused) so the player can close the game quickly; the restart
+	// happens once the game exits.
+	static int __cdecl LuaRelaunchGame(lua_State* luaState) {
+		if (!Config::EnableNetworkApi) {
+			lua_pushboolean(luaState, 0);
+			lua_pushstring(luaState, "RelaunchGame is disabled. Set EnableNetworkApi = true in TS2Extender.ini.");
+			return 2;
+		}
+		const char* args = lua_tostring(luaState, 1);
+		if (args == nullptr) {
+			lua_pushboolean(luaState, 0);
+			lua_pushstring(luaState, "args must be a string.");
+			return 2;
+		}
+		std::string error;
+		bool ok = false;
+		try {
+			ok = Relaunch::Arm(args, Config::RelaunchCloseTimeoutSeconds, error);
+		}
+		catch (const std::exception& e) {
+			error = e.what();
+		}
+		if (!ok) {
+			Log("Lua: RelaunchGame FAILED! %s\n", error.c_str());
+			lua_pushboolean(luaState, 0);
+			lua_pushstring(luaState, error.c_str());
+			return 2;
+		}
+		Relaunch::SendAltF4();
+		lua_pushboolean(luaState, 1);
+		return 1;
+	}
+
+	static int PushFailure(lua_State* luaState, const char* function, const std::string& message) {
+		Log("Lua: %s FAILED! %s\n", function, message.c_str());
+		lua_pushboolean(luaState, 0);
+		lua_pushstring(luaState, message.c_str());
+		return 2;
+	}
+
+	// Takes the callback at stack index `idx` as a registry reference. Returns LUA_NOREF if it can't be a function.
+	// The Lua wrappers have no lua_type, so only nil, strings and numbers are detected; anything else that
+	// isn't callable just fails inside lua_pcall when the result is delivered.
+	static int RefCallback(lua_State* luaState, int idx) {
+		if (lua_gettop(luaState) < idx || lua_tostring(luaState, idx) != nullptr)
+			return LUA_NOREF;
+		lua_pushvalue(luaState, idx);
+		int ref = luaL_ref(luaState, LUA_REGISTRYINDEX);
+		return ref < 0 ? LUA_NOREF : ref;
+	}
+
+	// boolean ok, string err DownloadFile(string url, string destPath, function callback [, string expectedSha256])
+	// Starts an HTTP(S) GET in a background thread and returns at once. destPath must be inside the staging
+	// folder (<GetUserDirectory()>\TS2ExtenderStaging). Later, from the game thread, callback(ok, err, bytes) is called.
+	static int __cdecl LuaDownloadFile(lua_State* luaState) {
+		if (!Config::EnableNetworkApi)
+			return PushFailure(luaState, "DownloadFile", "DownloadFile is disabled. Set EnableNetworkApi = true in TS2Extender.ini.");
+		const char* url = lua_tostring(luaState, 1);
+		const char* destPath = lua_tostring(luaState, 2);
+		if (url == nullptr || destPath == nullptr)
+			return PushFailure(luaState, "DownloadFile", "url and destPath must be strings.");
+		const char* sha256 = lua_gettop(luaState) >= 4 ? lua_tostring(luaState, 4) : nullptr;
+		int ref = RefCallback(luaState, 3);
+		if (ref == LUA_NOREF)
+			return PushFailure(luaState, "DownloadFile", "callback must be a function.");
+
+		std::string error;
+		bool ok = false;
+		try {
+			ok = Network::QueueDownload(luaState, ref, url, destPath, sha256 != nullptr ? sha256 : "", error);
+		}
+		catch (const std::exception& e) {
+			error = e.what();
+		}
+		if (!ok) {
+			luaL_unref(luaState, LUA_REGISTRYINDEX, ref);
+			return PushFailure(luaState, "DownloadFile", error);
+		}
+		lua_pushboolean(luaState, 1);
+		return 1;
+	}
+
+	// boolean ok, string err ExtractNeighborhood(string zipPath, string extractDir, function callback)
+	// Extracts a .zip from the staging folder into a NEW folder directly inside Neighborhoods, in a background
+	// thread. Nothing is ever overwritten: if extractDir exists, the callback gets ok=false.
+	// Later, from the game thread, callback(ok, err, bytes) is called; bytes is the uncompressed size written.
+	static int __cdecl LuaExtractNeighborhood(lua_State* luaState) {
+		if (!Config::EnableNetworkApi)
+			return PushFailure(luaState, "ExtractNeighborhood", "ExtractNeighborhood is disabled. Set EnableNetworkApi = true in TS2Extender.ini.");
+		const char* zipPath = lua_tostring(luaState, 1);
+		const char* extractDir = lua_tostring(luaState, 2);
+		if (zipPath == nullptr || extractDir == nullptr)
+			return PushFailure(luaState, "ExtractNeighborhood", "zipPath and extractDir must be strings.");
+		int ref = RefCallback(luaState, 3);
+		if (ref == LUA_NOREF)
+			return PushFailure(luaState, "ExtractNeighborhood", "callback must be a function.");
+
+		std::string error;
+		bool ok = false;
+		try {
+			ok = Network::QueueExtract(luaState, ref, zipPath, extractDir, error);
+		}
+		catch (const std::exception& e) {
+			error = e.what();
+		}
+		if (!ok) {
+			luaL_unref(luaState, LUA_REGISTRYINDEX, ref);
+			return PushFailure(luaState, "ExtractNeighborhood", error);
+		}
+		lua_pushboolean(luaState, 1);
+		return 1;
+	}
+
+	// boolean ok, string err ZipNeighborhood(string name, string zipDir, function callback)
+	// Zips the neighborhood folder `name` (for example "N001") from Neighborhoods into <zipDir>\<name>.zip, in a
+	// background thread. zipDir must be inside the staging folder. The live neighborhood is only read: it is first copied
+	// to <zipDir>\Temp, zipped from there, and the copy is deleted. Later, from the game thread,
+	// callback(ok, err, bytes) is called; bytes is the size of the .zip.
+	static int __cdecl LuaZipNeighborhood(lua_State* luaState) {
+		if (!Config::EnableNetworkApi)
+			return PushFailure(luaState, "ZipNeighborhood", "ZipNeighborhood is disabled. Set EnableNetworkApi = true in TS2Extender.ini.");
+		const char* name = lua_tostring(luaState, 1);
+		const char* zipDir = lua_tostring(luaState, 2);
+		if (name == nullptr || zipDir == nullptr)
+			return PushFailure(luaState, "ZipNeighborhood", "name and zipDir must be strings.");
+		int ref = RefCallback(luaState, 3);
+		if (ref == LUA_NOREF)
+			return PushFailure(luaState, "ZipNeighborhood", "callback must be a function.");
+
+		std::string error;
+		bool ok = false;
+		try {
+			ok = Network::QueueZip(luaState, ref, name, zipDir, error);
+		}
+		catch (const std::exception& e) {
+			error = e.what();
+		}
+		if (!ok) {
+			luaL_unref(luaState, LUA_REGISTRYINDEX, ref);
+			return PushFailure(luaState, "ZipNeighborhood", error);
+		}
+		lua_pushboolean(luaState, 1);
+		return 1;
+	}
+
+	// boolean ok, string err UploadNeighborhood(string url, string zipPath, function callback)
+	// Uploads a .zip from the staging folder with an HTTP POST (the raw file as the body, Content-Type application/zip),
+	// in a background thread. url is a full http(s) URL or a path starting with "/", which goes to ServerUrl.
+	// Later, from the game thread, callback(ok, err, status, response) is called, like HttpRequest's: ok is true for a 2xx
+	// status, status is the HTTP status (0 if the server never answered) and response is the body of the answer.
+	static int __cdecl LuaUploadNeighborhood(lua_State* luaState) {
+		if (!Config::EnableNetworkApi)
+			return PushFailure(luaState, "UploadNeighborhood", "UploadNeighborhood is disabled. Set EnableNetworkApi = true in TS2Extender.ini.");
+		const char* url = lua_tostring(luaState, 1);
+		const char* zipPath = lua_tostring(luaState, 2);
+		if (url == nullptr || zipPath == nullptr)
+			return PushFailure(luaState, "UploadNeighborhood", "url and zipPath must be strings.");
+		int ref = RefCallback(luaState, 3);
+		if (ref == LUA_NOREF)
+			return PushFailure(luaState, "UploadNeighborhood", "callback must be a function.");
+
+		std::string error;
+		bool ok = false;
+		try {
+			ok = Network::QueueUpload(luaState, ref, url, zipPath, error);
+		}
+		catch (const std::exception& e) {
+			error = e.what();
+		}
+		if (!ok) {
+			luaL_unref(luaState, LUA_REGISTRYINDEX, ref);
+			return PushFailure(luaState, "UploadNeighborhood", error);
+		}
+		lua_pushboolean(luaState, 1);
+		return 1;
+	}
+
+	// boolean ok, string err HttpRequest(string method, string url, string body, string headers, function callback)
+	// Sends an HTTP request in a background thread and returns at once. method is GET, HEAD, POST, PUT, PATCH, DELETE
+	// or OPTIONS. url is a full http(s) URL or a path starting with "/", which goes to ServerUrl. body and headers
+	// may be nil; headers is text with one "Name: value" per line. Later, from the game thread,
+	// callback(ok, err, status, response) is called: ok is true for a 2xx status, status is the HTTP status
+	// (0 if the server never answered) and response is the body of the answer.
+	static int __cdecl LuaHttpRequest(lua_State* luaState) {
+		if (!Config::EnableNetworkApi)
+			return PushFailure(luaState, "HttpRequest", "HttpRequest is disabled. Set EnableNetworkApi = true in TS2Extender.ini.");
+		const char* method = lua_tostring(luaState, 1);
+		const char* url = lua_tostring(luaState, 2);
+		if (method == nullptr || url == nullptr)
+			return PushFailure(luaState, "HttpRequest", "method and url must be strings.");
+		const char* body = lua_tostring(luaState, 3);
+		const char* headers = lua_tostring(luaState, 4);
+		int ref = RefCallback(luaState, 5);
+		if (ref == LUA_NOREF)
+			return PushFailure(luaState, "HttpRequest", "callback must be a function (pass nil for body or headers you don't use).");
+
+		std::string error;
+		bool ok = false;
+		try {
+			ok = Network::QueueRequest(luaState, ref, method, url, body != nullptr ? body : "", headers != nullptr ? headers : "", error);
+		}
+		catch (const std::exception& e) {
+			error = e.what();
+		}
+		if (!ok) {
+			luaL_unref(luaState, LUA_REGISTRYINDEX, ref);
+			return PushFailure(luaState, "HttpRequest", error);
+		}
+		lua_pushboolean(luaState, 1);
+		return 1;
+	}
+
 	static int __cdecl LuaSetLoadUIScriptDebug(lua_State* luaState) {
 		Core::_instance->m_LoadUIScriptDebug = lua_toboolean(luaState, 1) != 0;
 		return 0;
@@ -460,6 +718,12 @@ namespace LuaExtensions {
 			luaThread->Register(&LuaMatSetVariable, "MAT_SetVariable");
 			luaThread->Register(&LuaMatRemoveVariable, "MAT_RemoveVariable");
 			luaThread->Register(&LuaUIIsBusy, "UI_IsBusy");
+			luaThread->Register(&LuaRelaunchGame, "RelaunchGame");
+			luaThread->Register(&LuaDownloadFile, "DownloadFile");
+			luaThread->Register(&LuaExtractNeighborhood, "ExtractNeighborhood");
+			luaThread->Register(&LuaZipNeighborhood, "ZipNeighborhood");
+			luaThread->Register(&LuaUploadNeighborhood, "UploadNeighborhood");
+			luaThread->Register(&LuaHttpRequest, "HttpRequest");
 		}
 		return res;
 	}

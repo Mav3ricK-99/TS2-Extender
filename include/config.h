@@ -32,4 +32,12 @@ namespace Config {
 	extern bool ExtendedSimAntics;
 	extern bool SingleCore;
 	extern bool DisableGroupsCache;
+	extern bool EnableNetworkApi;
+	extern int RelaunchCloseTimeoutSeconds;
+	extern int DownloadMaxMegabytes;
+	extern int DownloadTimeoutSeconds;
+	extern int UploadMaxMegabytes;
+	extern int ExtractMaxMegabytes;
+	extern int HttpTimeoutSeconds;
+	extern std::string ServerUrl;
 }

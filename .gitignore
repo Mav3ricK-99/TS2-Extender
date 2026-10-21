@@ -42,6 +42,9 @@ bld/
 # Visual Studio 2017 auto generated files
 Generated\ Files/
 
+#Tests
+tests/*
+
 # MSTest test Results
 [Tt]est[Rr]esult*/
 [Bb]uild[Ll]og.*
@@ -192,6 +195,9 @@ publish/
 # checkin your Azure Web App publish settings, but sensitive information contained
 # in these scripts will be unencrypted
 PublishScripts/
+
+#Scripts
+scripts/*.cmd
 
 # NuGet Packages
 *.nupkg
@@ -362,3 +368,6 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+#CLAUDE md
+CLAUDE.md

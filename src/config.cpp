@@ -35,6 +35,14 @@ namespace Config {
 	bool ExtendedSimAntics;
 	bool SingleCore;
 	bool DisableGroupsCache;
+	bool EnableNetworkApi;
+	int RelaunchCloseTimeoutSeconds;
+	int DownloadMaxMegabytes;
+	int DownloadTimeoutSeconds;
+	int UploadMaxMegabytes;
+	int ExtractMaxMegabytes;
+	int HttpTimeoutSeconds;
+	std::string ServerUrl;
 
 	static bool Dirty = false;
 
@@ -112,6 +120,14 @@ namespace Config {
 		ExtendedSimAntics = GetBool("Advanced", "ExtendedSimAntics", true);
 		SingleCore = GetBool("Advanced", "SingleCore", false);
 		DisableGroupsCache = GetBool("Advanced", "DisableGroupsCache", true);
+		EnableNetworkApi = GetBool("Network", "EnableNetworkApi", false);
+		RelaunchCloseTimeoutSeconds = GetInt("Network", "RelaunchCloseTimeoutSeconds", 300);
+		DownloadMaxMegabytes = GetInt("Network", "DownloadMaxMegabytes", 1024);
+		DownloadTimeoutSeconds = GetInt("Network", "DownloadTimeoutSeconds", 600);
+		UploadMaxMegabytes = GetInt("Network", "UploadMaxMegabytes", 1024);
+		ExtractMaxMegabytes = GetInt("Network", "ExtractMaxMegabytes", 4096);
+		HttpTimeoutSeconds = GetInt("Network", "HttpTimeoutSeconds", 15);
+		ServerUrl = GetString("Network", "ServerUrl", "");
 		Separates4All = GetBool("Enhancements", "Separates4All", false);
 		FreeZodiac = GetBool("Enhancements", "FreeZodiac", false);
 #if TS2_LC
